@@ -258,6 +258,10 @@ class GameClient:
                     break
                 if verbose:
                     print("  ✓ Move accepted")
+                    try:
+                        print(f"\n{self.get_board(game_id)}")
+                    except Exception:
+                        pass
             except Exception as exc:
                 print(f"  ERROR in move function: {exc}")
                 break
