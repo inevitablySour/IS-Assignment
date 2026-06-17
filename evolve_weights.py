@@ -2,23 +2,21 @@
 """
 Hill-climbing weight tuner for the Alpha-Beta agent.
 
-Mutates evaluation weights (ATTACK, DEFEND, CONVERGE, FORK_BONUS) and
-plays the mutant against the current best. If the mutant wins more games,
-it becomes the new best. Repeats for N rounds.
-
-All games are logged to game_logs.db with type='evolve'.
-Best weights are saved to evolved_weights.json after each improvement.
+Each round generates N mutants (one per physical CPU core) and evaluates all
+of them against the current best simultaneously in one pool.map call.
+The mutant with the most wins is adopted if it beats current.
+This keeps all cores busy throughout — no idle gaps between rounds.
 
 Usage:
-    python evolve_weights.py                      # 100 rounds, 4 games each
+    python evolve_weights.py                      # 100 rounds, 4 games/mutant
     python evolve_weights.py --rounds 50          # fewer rounds
-    python evolve_weights.py --games 6 --time 2   # more games, faster
+    python evolve_weights.py --games 6 --time 2   # more games per mutant, faster
+    python evolve_weights.py --fresh              # restart from default weights
 """
 
 import argparse
 import copy
 import json
-import math
 import multiprocessing as mp
 import os
 import random
@@ -28,7 +26,7 @@ import uuid
 import importlib
 import importlib.util
 
-# ── Game engine (copied from fast_selfplay.py) ──────────────────────
+# ── Game engine ──────────────────────────────────────────────────────
 
 WIN = 6
 DIRECTIONS = [(0, 1), (1, 0), (1, 1), (1, -1)]
@@ -91,10 +89,9 @@ def play_game(agent_x, agent_o, time_limit=1.0, max_moves=200):
     return "DRAW"
 
 
-# ── Agent loading with weight injection ─────────────────────────────
+# ── Agent loading with weight injection ──────────────────────────────
 
 def load_module():
-    """Load the student_agent module once."""
     base = os.path.dirname(os.path.abspath(__file__))
     path = os.path.join(base, "student_agent.py")
     spec = importlib.util.spec_from_file_location("student_agent_evol", path)
@@ -104,8 +101,6 @@ def load_module():
 
 
 def make_agent(mod, weights, time_cap=1.0):
-    """Create an agent with injected weights."""
-    # Override module-level constants
     mod.ATTACK = list(weights["ATTACK"])
     mod.DEFEND = list(weights["DEFEND"])
     mod.CONVERGE = list(weights["CONVERGE"])
@@ -114,7 +109,7 @@ def make_agent(mod, weights, time_cap=1.0):
     return mod.StudentAgent()
 
 
-# ── Weight operations ───────────────────────────────────────────────
+# ── Weight operations ─────────────────────────────────────────────────
 
 DEFAULT_WEIGHTS = {
     "ATTACK":     [0, 1, 12, 120, 1_200, 120_000, 10_000_000],
@@ -125,14 +120,7 @@ DEFAULT_WEIGHTS = {
 
 
 def mutate(weights, strength=0.3):
-    """
-    Return a mutated copy of weights.
-    Each weight has a chance of being scaled by a random factor.
-    strength controls how wild mutations can be (0.3 = ±30%).
-    """
     w = copy.deepcopy(weights)
-
-    # Pick which weight group to mutate (focus mutation)
     target = random.choice(["ATTACK", "DEFEND", "CONVERGE", "FORK_BONUS"])
 
     if target == "FORK_BONUS":
@@ -140,14 +128,11 @@ def mutate(weights, strength=0.3):
         w["FORK_BONUS"] = max(1000, int(w["FORK_BONUS"] * factor))
     else:
         arr = w[target]
-        # Mutate 1-2 indices (skip index 0 which is always 0, and last which is win score)
         mutable = list(range(1, len(arr) - 1))
         n_mutate = random.randint(1, min(2, len(mutable)))
         for idx in random.sample(mutable, n_mutate):
             factor = random.uniform(1 - strength, 1 + strength)
             arr[idx] = max(1, int(arr[idx] * factor))
-
-        # Enforce monotonicity (each index should be >= previous)
         for i in range(2, len(arr) - 1):
             if arr[i] < arr[i - 1]:
                 arr[i] = arr[i - 1] + 1
@@ -155,18 +140,18 @@ def mutate(weights, strength=0.3):
     return w
 
 
+# ── Worker ────────────────────────────────────────────────────────────
+
 def _play_one_game(args_tuple):
     """
-    Worker function for multiprocessing.
-    Takes (weights_a, weights_b, time_cap, a_plays_x) and returns 'a', 'b', or 'draw'.
+    Worker: plays one game between weights_a and weights_b.
+    Returns 'a', 'b', or 'draw'.
     """
     weights_a, weights_b, time_cap, a_plays_x = args_tuple
-    # Suppress all print output in workers (avoid I/O contention)
     import io
     sys.stdout = io.StringIO()
     sys.stderr = io.StringIO()
 
-    # Each worker loads its own module (separate process = no shared state)
     mod_a = load_module()
     mod_b = load_module()
     agent_a = make_agent(mod_a, weights_a, time_cap)
@@ -184,31 +169,33 @@ def _play_one_game(args_tuple):
         else:               return "draw"
 
 
-def play_match(weights_a, weights_b, n_games, time_cap, n_workers=None):
+# ── Match (all mutants in one pool.map call) ──────────────────────────
+
+def play_match(current, mutants, games_per_mutant, time_cap, pool):
     """
-    Play n_games between weights_a and weights_b in parallel.
-    Returns (a_wins, b_wins, draws).
+    Evaluate every mutant against current simultaneously.
+    Submits len(mutants) * games_per_mutant tasks in one pool.map call so
+    workers always have queued work and the tail-idle problem is minimised.
+
+    Returns list of (mutant_wins, current_wins, draws) per mutant.
+    'a' = current won, 'b' = mutant won (current is always weights_a).
     """
-    if n_workers is None:
-        n_workers = min(n_games, mp.cpu_count() // 2)  # 2 agents per game
+    tasks = [
+        (current, mutant, time_cap, gi % 2 == 0)
+        for mutant in mutants
+        for gi in range(games_per_mutant)
+    ]
 
-    # Build task list: alternate sides
-    tasks = []
-    for gi in range(n_games):
-        a_plays_x = (gi % 2 == 0)
-        tasks.append((weights_a, weights_b, time_cap, a_plays_x))
+    results = pool.map(_play_one_game, tasks)
 
-    # Run in parallel
-    with mp.Pool(processes=n_workers) as pool:
-        results = pool.map(_play_one_game, tasks)
-
-    a_wins = results.count("a")
-    b_wins = results.count("b")
-    draws = results.count("draw")
-    return a_wins, b_wins, draws
+    scores = []
+    for mi in range(len(mutants)):
+        chunk = results[mi * games_per_mutant:(mi + 1) * games_per_mutant]
+        scores.append((chunk.count("b"), chunk.count("a"), chunk.count("draw")))
+    return scores
 
 
-# ── Main ────────────────────────────────────────────────────────────
+# ── Persistence ───────────────────────────────────────────────────────
 
 WEIGHTS_FILE = "evolved_weights.json"
 
@@ -236,12 +223,14 @@ def load_weights():
     return copy.deepcopy(DEFAULT_WEIGHTS)
 
 
+# ── Main ──────────────────────────────────────────────────────────────
+
 def main():
     parser = argparse.ArgumentParser(description="Hill-climbing weight tuner")
     parser.add_argument("--rounds", type=int, default=100,
                         help="Number of mutation rounds (default 100)")
     parser.add_argument("--games", type=int, default=4,
-                        help="Games per matchup (default 4, must be even)")
+                        help="Games per mutant per round (default 4, must be even)")
     parser.add_argument("--time", type=float, default=1.0,
                         help="Time cap per move in seconds (default 1)")
     parser.add_argument("--strength", type=float, default=0.3,
@@ -251,77 +240,90 @@ def main():
     args = parser.parse_args()
 
     if args.games % 2 != 0:
-        args.games += 1  # ensure even for fair side-swapping
+        args.games += 1
 
-    n_workers = min(args.games, mp.cpu_count() // 2)
-    mod = load_module()  # initial load to verify
+    # One process per physical core; SMT doesn't help CPU-bound search
+    n_workers = mp.cpu_count() // 2
+    # One mutant per worker → total tasks = n_workers * games_per_mutant
+    n_mutants = n_workers
+    games_per_mutant = args.games
+
+    load_module()  # verify student_agent loads cleanly before spawning pool
 
     print("=" * 60)
     print("  Hill-Climbing Weight Tuner")
     print("=" * 60)
-    print(f"  Rounds: {args.rounds}  |  Games/round: {args.games}  "
-          f"|  Time/move: {args.time}s")
-    print(f"  Mutation strength: {args.strength}  |  Workers: {n_workers}")
+    print(f"  Rounds:       {args.rounds}")
+    print(f"  Mutants/round:{n_mutants}  (one per physical core)")
+    print(f"  Games/mutant: {games_per_mutant}")
+    print(f"  Tasks/round:  {n_mutants * games_per_mutant}  across {n_workers} workers")
+    print(f"  Time/move:    {args.time}s  |  Mutation strength: {args.strength}")
     print("=" * 60)
 
     current = load_weights() if not args.fresh else copy.deepcopy(DEFAULT_WEIGHTS)
     improvements = 0
     total_games = 0
 
-    # Log to DB
     from game_db import GameDB
     db = GameDB()
 
-    print(f"\n  Starting weights:")
+    print("\n  Starting weights:")
     for k, v in current.items():
         print(f"    {k}: {v}")
     print()
 
-    for rnd in range(1, args.rounds + 1):
-        mutant = mutate(current, args.strength)
+    with mp.Pool(processes=n_workers) as pool:
+        for rnd in range(1, args.rounds + 1):
+            mutants = [mutate(current, args.strength) for _ in range(n_mutants)]
 
-        # Show what changed
-        diffs = []
-        for k in current:
-            if current[k] != mutant[k]:
-                diffs.append(f"{k}: {current[k]} -> {mutant[k]}")
+            t0 = time.time()
+            scores = play_match(current, mutants, games_per_mutant, args.time, pool)
+            elapsed = time.time() - t0
+            total_games += n_mutants * games_per_mutant
 
-        t0 = time.time()
-        a_wins, b_wins, draws = play_match(current, mutant,
-                                            args.games, args.time,
-                                            n_workers=n_workers)
-        elapsed = time.time() - t0
-        total_games += args.games
+            # Best mutant by win count against current
+            best_mi, (best_mw, best_cw, best_d) = max(
+                enumerate(scores), key=lambda x: x[1][0]
+            )
 
-        # Log match to DB
-        game_id = f"evolve-r{rnd}-{uuid.uuid4().hex[:8]}"
-        db.insert_game(
-            game_id=game_id,
-            timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            game_type="evolve",
-            my_symbol="*", opponent_symbol="*",
-            result=f"current={a_wins} mutant={b_wins} draw={draws}",
-            total_moves=0,
-            agent_name="current",
-            opponent_name="mutant",
-            config_notes=json.dumps({"mutated": diffs, "round": rnd}),
-        )
-        db.commit()
+            game_id = f"evolve-r{rnd}-{uuid.uuid4().hex[:8]}"
+            db.insert_game(
+                game_id=game_id,
+                timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                game_type="evolve",
+                my_symbol="*", opponent_symbol="*",
+                result=f"best_mutant={best_mw} current={best_cw} draw={best_d}",
+                total_moves=0,
+                agent_name="current",
+                opponent_name="mutants",
+                config_notes=json.dumps({
+                    "n_mutants": n_mutants,
+                    "round": rnd,
+                    "best_mutant_idx": best_mi,
+                }),
+            )
+            db.commit()
 
-        if b_wins > a_wins:
-            current = mutant
-            improvements += 1
-            save_weights(current, rnd, {"improvements": improvements,
-                                         "total_rounds": rnd,
-                                         "total_games": total_games})
-            print(f"  R{rnd:>3}: ★ IMPROVED  {a_wins}-{b_wins}-{draws}  "
-                  f"({elapsed:.0f}s)  {'; '.join(diffs)}")
-        elif a_wins > b_wins:
-            print(f"  R{rnd:>3}:   kept      {a_wins}-{b_wins}-{draws}  "
-                  f"({elapsed:.0f}s)")
-        else:
-            print(f"  R{rnd:>3}:   tied      {a_wins}-{b_wins}-{draws}  "
-                  f"({elapsed:.0f}s)")
+            if best_mw > best_cw:
+                best_mutant = mutants[best_mi]
+                diffs = [
+                    f"{k}: {current[k]} -> {best_mutant[k]}"
+                    for k in current if current[k] != best_mutant[k]
+                ]
+                current = best_mutant
+                improvements += 1
+                save_weights(current, rnd, {
+                    "improvements": improvements,
+                    "total_rounds": rnd,
+                    "total_games": total_games,
+                })
+                print(f"  R{rnd:>3}: ★ IMPROVED  "
+                      f"best={best_mw}-{best_cw}-{best_d}  "
+                      f"({elapsed:.0f}s)  {'; '.join(diffs)}")
+            else:
+                print(f"  R{rnd:>3}:   no gain    "
+                      f"best={best_mw}-{best_cw}-{best_d}  "
+                      f"({elapsed:.0f}s)")
 
     db.close()
 
@@ -329,13 +331,15 @@ def main():
     print(f"  DONE — {args.rounds} rounds, {total_games} games")
     print(f"  Improvements: {improvements}")
     print(f"{'='*60}")
-    print(f"  Final weights:")
+    print("  Final weights:")
     for k, v in current.items():
         print(f"    {k}: {v}")
     print(f"\n  Saved to {WEIGHTS_FILE}")
-    save_weights(current, args.rounds, {"improvements": improvements,
-                                         "total_rounds": args.rounds,
-                                         "total_games": total_games})
+    save_weights(current, args.rounds, {
+        "improvements": improvements,
+        "total_rounds": args.rounds,
+        "total_games": total_games,
+    })
 
 
 if __name__ == "__main__":
